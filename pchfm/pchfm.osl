@@ -1,0 +1,183 @@
+// ----------------------------
+// MP
+// ----------------------------
+float compute_I0(float x)
+{
+    x = clamp(x, -10.0, 10.0);
+    float x2 = x * x;
+    float term = 1.0;
+    float result = 1.0;
+    // i=1
+    term *= x2;
+    result += term / 4.0;
+    // i=2
+    term *= x2;
+    result += term / 64.0;
+    // i=3
+    term *= x2;
+    result += term / 2304.0;
+    // i=4
+    term *= x2;
+    result += term / 147456.0;
+    // i=5
+    term *= x2;
+    result += term / 14745600.0;
+
+
+    return result;
+}
+
+float MP(float inv_v_beta_m, float sin_ti, float sin_tr, float cos_ti, float cos_tr)
+{
+    // coef (paper csch)
+    float sinh_inv_v = 0.5 * (exp(inv_v_beta_m) - exp(-inv_v_beta_m));
+    float coef = (inv_v_beta_m * 0.5) / sinh_inv_v;
+
+    float e = exp(clamp(-sin_ti * sin_tr * inv_v_beta_m, -10.0, 10.0));
+    float I0 = compute_I0(cos_ti * cos_tr * inv_v_beta_m);
+
+    return coef * e * I0;
+}
+
+// ----------------------------
+// NP
+// ----------------------------
+float Fresnel(float eta, float theta)
+{
+    float cos_theta = cos(theta);
+
+    float F0 = (1.0 - eta) / (1.0 + eta);
+    F0 *= F0;
+    return F0 + (1.0 - F0) * pow(1.0 - cos_theta, 5.0);
+}
+
+float paper_f(float eta, float theta_d, float h)
+{
+    return Fresnel(eta, acos(cos(theta_d) * cos(asin(h))));
+}
+
+color paper_t(color sigma_alpha, float cos_theta_t, float gamma_t_val)
+{
+    return color(
+        exp(-2 * (sigma_alpha[0] / cos_theta_t) * (1 + cos(2 * gamma_t_val))),
+        exp(-2 * (sigma_alpha[1] / cos_theta_t) * (1 + cos(2 * gamma_t_val))),
+        exp(-2 * (sigma_alpha[2] / cos_theta_t) * (1 + cos(2 * gamma_t_val)))
+    );
+}
+
+float gamma_t(float h, float eta, float theta_d)
+{
+    float eta_prime = sqrt(eta * eta - sin(theta_d) * sin(theta_d)) / cos(theta_d);
+    float arg = clamp(h / eta_prime, -1.0, 1.0);
+    return asin(arg);
+}
+
+color AP(float eta, float h, float theta_d, float cos_theta_t, color sigma_alpha, vector wi, vector wo, int p)
+{
+    if (p==0)
+    {
+        float half_angle = 0.5 * acos(dot(wi, wo));
+        return color(Fresnel(eta, half_angle));
+    }
+    float gamma_t_value = gamma_t(h, eta, theta_d);
+    float f = paper_f(eta, theta_d, h);
+    color T = paper_t(sigma_alpha, cos_theta_t, gamma_t_value);
+
+    color f_color = color(f);
+    color one_minus_f = color(1) - f_color;
+    color one_minus_f_sq = one_minus_f * one_minus_f;
+
+    if (p < 3)
+        return one_minus_f_sq * pow(f_color, p - 1) * pow(T, p);
+        
+    color sum = color(0.0, 0.0, 0.0);
+    for (int k = 3; k <= 5; k++)
+        sum += one_minus_f_sq * f_color * f_color * T * T * T / (color(1) - f_color * T);
+    return sum;
+}
+
+float D_phi(float phi, float s)
+{
+    float w = phi - M_2PI * floor((phi + M_PI) / M_2PI);
+    float s2 = max(s * sqrt(M_PI / 8.0), 1e-6);
+    float num = exp(clamp(-w / s2, -15.0, 15.0));
+    float l = num / (s2 * (1.0 + num) * (1.0 + num));
+    float cdf_pos = 1.0 / (1.0 + exp(clamp(-M_PI / s2, -15.0, 15.0)));
+    float cdf_neg = 1.0 / (1.0 + exp(clamp( M_PI / s2, -15.0, 15.0)));
+    return l / max(cdf_pos - cdf_neg, 1e-10);
+}
+
+// ----------------------------
+// Shader
+// ----------------------------
+shader TER(
+    float alpha_p = 0.0,
+    float beta_m = 0.5,
+    float beta_n = 0.5,
+    float eta = 1.55,
+    color Albedo = color(1.0, 0.0, 0.0),
+    point light_pos = point(0, 0, 0),
+    output closure color bcsdf = 0
+)
+{
+    vector T = normalize(dPdu);
+    vector B = normalize(cross(T, N));
+    vector wo = normalize(-I);
+    vector wi = normalize(light_pos - P);
+    // phi
+    float phi_i = atan2(dot(wi, B), dot(wi, N));
+    float phi_o = atan2(dot(wo, B), dot(wo, N));
+    float phi = phi_o - phi_i;
+
+    // h : offset
+    float h = clamp(dot(wi, B), -1.0, 1.0);
+
+    // ingoing
+    float sin_ti = clamp(dot(wi, T), -1.0, 1.0);
+    float cos_ti = sqrt(max(0.0, 1.0 - sin_ti * sin_ti));
+
+    // perfect reflection
+    float sin_tr_raw = -sin_ti;
+    float cos_tr_raw = sqrt(max(0.0, 1.0 - sin_tr_raw * sin_tr_raw));
+
+    // cuticle tilt
+    float alpha = radians(alpha_p);
+
+    // outgoing angle
+    float sin_tr = sin_tr_raw * cos(alpha) - cos_tr_raw * sin(alpha);
+
+    float cos_tr = sqrt(max(0.0, 1.0 - sin_tr * sin_tr));;
+    // roughness
+    float v_rough = max(pow((0.726 * beta_m + 0.812 * pow(beta_m, 2) + 3.7 * pow(beta_m, 20)), 2), 1e-8);
+
+    float inv_v = 1.0 / v_rough;
+
+    float s_beta_n = max(0.265 * beta_n + 1.194 * pow(beta_n, 2) + 5.372 * pow(beta_n, 22), 1e-8);
+    // absorption
+    float denom = 5.969 - 0.215 * beta_n + 2.532 * pow(beta_n, 2) - 10.73 * pow(beta_n, 3) + 5.574 * pow(beta_n, 4) + 0.245 * pow(beta_n, 5);
+    color sigma_alpha = color(
+        pow(log(Albedo[0]) / denom, 2),
+        pow(log(Albedo[1]) / denom, 2),
+        pow(log(Albedo[2]) / denom, 2)
+    );
+
+    // theta d
+    float theta_d = 0.5 * (asin(sin_ti) - asin(sin_tr));
+
+    float cos_theta_t = sqrt(max(0.0, 1.0 - (sin_ti * sin_ti) / (eta * eta)));
+    // MP per lobe
+    float MP_val = MP(inv_v, sin_ti, sin_tr, cos_ti, cos_tr);
+    // NP
+    float D_phi_val = D_phi(phi, s_beta_n);
+    color a_R = AP(eta, h, theta_d, cos_theta_t, sigma_alpha, wi, wo, 0);
+    color a_TT = AP(eta, h, theta_d, cos_theta_t, sigma_alpha, wi, wo, 1);
+    color a_TRT = AP(eta, h, theta_d, cos_theta_t, sigma_alpha, wi, wo, 2);
+    color a_TRRT = AP(eta, h, theta_d, cos_theta_t, sigma_alpha, wi, wo, 3);
+
+    color result = MP_val * a_R * D_phi_val
+                    + MP_val * a_TT * D_phi_val
+                    + MP_val * a_TRT * D_phi_val
+                    + MP_val * a_TRRT * (1.0 / (2.0 * M_PI));
+
+    bcsdf = result * diffuse(N);
+}
