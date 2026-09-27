@@ -1,5 +1,5 @@
 # Author
 ## Arnaud Peler
 ## Clément Potier
-## Isaac Lluí
+## Isaac Lluís
 ## Ryan Rodrigues
